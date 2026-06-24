@@ -110,6 +110,13 @@ func OpenDB(dataDir string, config config.StateStoreConfig) (types.StateStore, e
 		MemTableStopWritesThreshold: 4,
 	}
 
+	// Allow Pebble to run up to 4 concurrent compactions when it falls behind
+	// (e.g. hourly State Store pruning floods the LSM with delete tombstones).
+	// Steady state stays at 1, so no extra cost when idle. The default {1,1}
+	// let prune debt accumulate over uptime, slowing prunes and stalling
+	// block commits, which made the node fall behind the chain head.
+	opts.CompactionConcurrencyRange = func() (lower, upper int) { return 1, 4 }
+
 	// Configure L0 with explicit settings
 	opts.Levels[0].BlockSize = 32 << 10       // 32 KB
 	opts.Levels[0].IndexBlockSize = 256 << 10 // 256 KB
