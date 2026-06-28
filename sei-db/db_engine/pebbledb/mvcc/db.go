@@ -515,6 +515,7 @@ func (db *Database) Prune(version int64) (_err error) {
 		prevKey, prevKeyEncoded, prevValEncoded []byte
 		prevVersionDecoded                      int64
 		prevStore                               string
+		firstDel, lastDel                       []byte
 	)
 
 	for itr.First(); itr.Valid(); {
@@ -570,6 +571,10 @@ func (db *Database) Prune(version int64) (_err error) {
 			if err != nil {
 				return err
 			}
+			if firstDel == nil {
+				firstDel = slices.Clone(prevKeyEncoded)
+			}
+			lastDel = slices.Clone(prevKeyEncoded)
 
 			counter++
 			if counter >= PruneCommitBatchSize {
@@ -597,6 +602,13 @@ func (db *Database) Prune(version int64) (_err error) {
 		err = batch.Commit(defaultWriteOpts)
 		if err != nil {
 			return err
+		}
+	}
+
+	if firstDel != nil {
+		end := append(slices.Clone(lastDel), 0x00)
+		if err := db.storage.Compact(context.Background(), firstDel, end, true); err != nil {
+			return fmt.Errorf("post-prune compaction: %w", err)
 		}
 	}
 
