@@ -35,6 +35,7 @@ const (
 	StorePrefixTpl     = "s/k:%s/" // s/k:<storeKey>
 	latestVersionKey   = "s/_latest"
 	earliestVersionKey = "s/_earliest"
+	compactCursorKey   = "s/_compactcursor"
 	tombstoneVal       = "TOMBSTONE"
 
 	// TODO: Make configurable
@@ -42,6 +43,8 @@ const (
 	PruneCommitBatchSize  = 50
 	DeleteCommitBatchSize = 50
 	MinWALEntriesToKeep   = 1000
+
+	PruneCompactionTargetBytes = 2 << 30
 )
 
 var (
@@ -54,6 +57,7 @@ type Database struct {
 	storage      *pebble.DB
 	asyncWriteWG sync.WaitGroup
 	config       config.StateStoreConfig
+	comparer *pebble.Comparer
 	// Earliest version for db after pruning
 	earliestVersion atomic.Int64
 	// Latest version for db
@@ -165,6 +169,7 @@ func OpenDB(dataDir string, config config.StateStoreConfig) (types.StateStore, e
 		storage:         db,
 		asyncWriteWG:    sync.WaitGroup{},
 		config:          config,
+		comparer:        comparer,
 		earliestVersion: atomic.Int64{},
 		latestVersion:   atomic.Int64{},
 		pendingChanges:  make(chan VersionedChangesets, config.AsyncWriteBuffer),
@@ -515,7 +520,6 @@ func (db *Database) Prune(version int64) (_err error) {
 		prevKey, prevKeyEncoded, prevValEncoded []byte
 		prevVersionDecoded                      int64
 		prevStore                               string
-		firstDel, lastDel                       []byte
 	)
 
 	for itr.First(); itr.Valid(); {
@@ -571,10 +575,6 @@ func (db *Database) Prune(version int64) (_err error) {
 			if err != nil {
 				return err
 			}
-			if firstDel == nil {
-				firstDel = slices.Clone(prevKeyEncoded)
-			}
-			lastDel = slices.Clone(prevKeyEncoded)
 
 			counter++
 			if counter >= PruneCommitBatchSize {
@@ -605,14 +605,129 @@ func (db *Database) Prune(version int64) (_err error) {
 		}
 	}
 
-	if firstDel != nil {
-		end := append(slices.Clone(lastDel), 0x00)
-		if err := db.storage.Compact(context.Background(), firstDel, end, true); err != nil {
-			return fmt.Errorf("post-prune compaction: %w", err)
+	if err := db.SetEarliestVersion(earliestVersion, false); err != nil {
+		return err
+	}
+
+	return db.compactPruneSlice(PruneCompactionTargetBytes)
+}
+
+type tableSpan struct {
+	smallest, largest []byte
+	size              uint64
+	numEntries        uint64
+	numDeletions      uint64
+}
+
+func toTableSpans(levels [][]pebble.SSTableInfo) [][]tableSpan {
+	out := make([][]tableSpan, len(levels))
+	for i, level := range levels {
+		out[i] = make([]tableSpan, len(level))
+		for j := range level {
+			t := &level[j]
+			out[i][j] = tableSpan{
+				smallest:     t.Smallest.UserKey,
+				largest:      t.Largest.UserKey,
+				size:         t.Size,
+				numEntries:   t.TableStats.NumEntries,
+				numDeletions: t.TableStats.NumDeletions,
+			}
+		}
+	}
+	return out
+}
+
+func (db *Database) compactPruneSlice(targetBytes uint64) error {
+	sst, err := db.storage.SSTables()
+	if err != nil {
+		return fmt.Errorf("post-prune compaction: list sstables: %w", err)
+	}
+	levels := toTableSpans(sst)
+	bottom := levels[len(levels)-1]
+	if len(bottom) == 0 {
+		return nil
+	}
+
+	cursor, err := db.readCompactCursor()
+	if err != nil {
+		return err
+	}
+
+	cmp := db.comparer.Compare
+	start, end := selectPruneSlice(bottom, cursor, targetBytes, cmp)
+	sliceStart, sliceEnd := bottom[start].smallest, bottom[end].largest
+
+	if cmp(sliceStart, sliceEnd) < 0 && mayContainDeletions(levels[:len(levels)-1], sliceStart, sliceEnd, cmp) {
+		if err := db.storage.Compact(context.Background(), sliceStart, sliceEnd, true); err != nil {
+			return fmt.Errorf("post-prune compaction of slice [%X, %X]: %w", sliceStart, sliceEnd, err)
 		}
 	}
 
-	return db.SetEarliestVersion(earliestVersion, false)
+	return db.advanceCompactCursor(bottom, end)
+}
+
+func selectPruneSlice(bottom []tableSpan, cursor []byte, targetBytes uint64, cmp func(a, b []byte) int) (start, end int) {
+	if len(cursor) > 0 {
+		start = len(bottom)
+		for i := range bottom {
+			if cmp(bottom[i].largest, cursor) > 0 {
+				start = i
+				break
+			}
+		}
+		if start == len(bottom) {
+			start = 0
+		}
+	}
+	var sliceBytes uint64
+	for end = start; end < len(bottom)-1; end++ {
+		sliceBytes += bottom[end].size
+		if sliceBytes >= targetBytes {
+			break
+		}
+	}
+	return start, end
+}
+
+func mayContainDeletions(upperLevels [][]tableSpan, sliceStart, sliceEnd []byte, cmp func(a, b []byte) int) bool {
+	for _, level := range upperLevels {
+		for i := range level {
+			t := &level[i]
+			if cmp(t.smallest, sliceEnd) > 0 || cmp(t.largest, sliceStart) < 0 {
+				continue
+			}
+			if t.numEntries == 0 || t.numDeletions > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (db *Database) readCompactCursor() ([]byte, error) {
+	val, closer, err := db.storage.Get([]byte(compactCursorKey))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("post-prune compaction: read cursor: %w", err)
+	}
+	cursor := slices.Clone(val)
+	_ = closer.Close()
+	return cursor, nil
+}
+
+func (db *Database) advanceCompactCursor(bottom []tableSpan, end int) error {
+	if end >= len(bottom)-1 {
+		if err := db.storage.Delete([]byte(compactCursorKey), defaultWriteOpts); err != nil {
+			return fmt.Errorf("post-prune compaction: reset cursor: %w", err)
+		}
+		return nil
+	}
+	if err := db.storage.Set([]byte(compactCursorKey), bottom[end].largest, defaultWriteOpts); err != nil {
+		return fmt.Errorf("post-prune compaction: save cursor: %w", err)
+	}
+	return nil
 }
 
 func (db *Database) Iterator(storeKey string, version int64, start, end []byte) (types.DBIterator, error) {
