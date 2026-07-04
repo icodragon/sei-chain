@@ -57,7 +57,7 @@ type Database struct {
 	storage      *pebble.DB
 	asyncWriteWG sync.WaitGroup
 	config       config.StateStoreConfig
-	comparer *pebble.Comparer
+	comparer     *pebble.Comparer
 	// Earliest version for db after pruning
 	earliestVersion atomic.Int64
 	// Latest version for db
@@ -72,6 +72,12 @@ type Database struct {
 
 	// Pending changes to be written to the DB
 	pendingChanges chan VersionedChangesets
+
+	// Background post-prune compaction worker
+	compactRequests chan struct{}
+	compactQuit     chan struct{}
+	compactWG       sync.WaitGroup
+	compactRuns     atomic.Int64
 
 	// Cancel function for background metrics collection
 	metricsCancel context.CancelFunc
@@ -173,6 +179,8 @@ func OpenDB(dataDir string, config config.StateStoreConfig) (types.StateStore, e
 		earliestVersion: atomic.Int64{},
 		latestVersion:   atomic.Int64{},
 		pendingChanges:  make(chan VersionedChangesets, config.AsyncWriteBuffer),
+		compactRequests: make(chan struct{}, 1),
+		compactQuit:     make(chan struct{}),
 	}
 	database.latestVersion.Store(latestVersion)
 	database.earliestVersion.Store(earliestVersion)
@@ -192,6 +200,9 @@ func OpenDB(dataDir string, config config.StateStoreConfig) (types.StateStore, e
 	database.streamHandler = streamHandler
 	database.asyncWriteWG.Add(1)
 	go database.writeAsyncInBackground()
+
+	database.compactWG.Add(1)
+	go database.compactInBackground()
 
 	// Start background metrics collection
 	metricsCtx, metricsCancel := context.WithCancel(context.Background())
@@ -215,6 +226,12 @@ func (db *Database) Close() error {
 		// Now close the WAL stream
 		_ = db.streamHandler.Close()
 		db.streamHandler = nil
+	}
+
+	if db.compactQuit != nil {
+		close(db.compactQuit)
+		db.compactWG.Wait()
+		db.compactQuit = nil
 	}
 	// Make Close idempotent: Pebble panics if Close is called twice.
 	if db.storage == nil {
@@ -609,7 +626,28 @@ func (db *Database) Prune(version int64) (_err error) {
 		return err
 	}
 
-	return db.compactPruneSlice(PruneCompactionTargetBytes)
+	db.requestPruneCompaction()
+	return nil
+}
+
+func (db *Database) requestPruneCompaction() {
+	select {
+	case db.compactRequests <- struct{}{}:
+	default:
+	}
+}
+
+func (db *Database) compactInBackground() {
+	defer db.compactWG.Done()
+	for {
+		select {
+		case <-db.compactQuit:
+			return
+		case <-db.compactRequests:
+			_ = db.compactPruneSlice(PruneCompactionTargetBytes)
+			db.compactRuns.Add(1)
+		}
+	}
 }
 
 type tableSpan struct {
