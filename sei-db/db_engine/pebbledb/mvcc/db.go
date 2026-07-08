@@ -45,6 +45,9 @@ const (
 	MinWALEntriesToKeep   = 1000
 
 	PruneCompactionTargetBytes = 2 << 30
+
+	prunePrefetchLeadEntries   = 1 << 21
+	prunePrefetchCheckInterval = 1 << 12
 )
 
 var (
@@ -532,6 +535,15 @@ func (db *Database) Prune(version int64) (_err error) {
 	batch := db.storage.NewBatch()
 	defer func() { _ = batch.Close() }()
 
+	pruneProgress := new(atomic.Int64)
+	prefetchQuit := make(chan struct{})
+	prefetchDone := make(chan struct{})
+	go db.prefetchPruneScan(pruneProgress, prefetchQuit, prefetchDone)
+	defer func() {
+		close(prefetchQuit)
+		<-prefetchDone
+	}()
+
 	var (
 		counter                                 int
 		prevKey, prevKeyEncoded, prevValEncoded []byte
@@ -540,6 +552,7 @@ func (db *Database) Prune(version int64) (_err error) {
 	)
 
 	for itr.First(); itr.Valid(); {
+		pruneProgress.Add(1)
 		currKeyEncoded := slices.Clone(itr.Key())
 
 		// Ignore metadata entries during pruning
@@ -628,6 +641,65 @@ func (db *Database) Prune(version int64) (_err error) {
 
 	db.requestPruneCompaction()
 	return nil
+}
+
+func (db *Database) prefetchPruneScan(progress *atomic.Int64, quit <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	itr, err := db.storage.NewIter(nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = itr.Close() }()
+
+	var scanned int64
+	var currStorePrefix []byte
+	for itr.First(); itr.Valid(); {
+		scanned++
+		if scanned%prunePrefetchCheckInterval == 0 {
+			for scanned-progress.Load() > prunePrefetchLeadEntries {
+				select {
+				case <-quit:
+					return
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			select {
+			case <-quit:
+				return
+			default:
+			}
+		}
+
+		key := itr.Key()
+		if isMetadataKey(key) {
+			itr.Next()
+			continue
+		}
+
+		if currStorePrefix == nil || !bytes.HasPrefix(key, currStorePrefix) {
+			currKey, _, ok := SplitMVCCKey(key)
+			if !ok {
+				itr.Next()
+				continue
+			}
+			storeKey, err := parseStoreKey(currKey)
+			if err != nil {
+				itr.Next()
+				continue
+			}
+			currStorePrefix = storePrefix(storeKey)
+			updated, ok := db.storeKeyDirty.Load(storeKey)
+			versionUpdated, typeOk := updated.(int64)
+			if !ok || (typeOk && versionUpdated < db.GetEarliestVersion()) {
+				itr.SeekGE(storePrefix(storeKey + "0"))
+				currStorePrefix = nil
+				continue
+			}
+		}
+
+		_ = itr.Value()
+		itr.Next()
+	}
 }
 
 func (db *Database) requestPruneCompaction() {
